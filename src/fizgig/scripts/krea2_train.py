@@ -1,4 +1,4 @@
-"""Krea 2 LoRA training CLI (wraps fizgig.krea2.trainer.train_krea2).
+﻿"""Krea 2 LoRA training CLI (wraps fizgig.krea2.trainer.train_krea2).
 
 The GUI drives the full run as three steps: krea2_cache_latents -> krea2_cache_text -> krea2_train.
 Trains on the RAW model; previews render on the fp8 Turbo (--turbo_dit) with the live LoRA.
@@ -119,7 +119,7 @@ def setup_parser() -> argparse.ArgumentParser:
                         + ", ".join(available_optimizers()))
     p.add_argument("--optimizer_args", default="",
                    help='Extra optimizer kwargs, e.g. "weight_decay=0.01 betas=0.9,0.99"')
-    p.add_argument("--compile_blocks", default="auto", choices=["auto", "on", "off"],
+    p.add_argument("--compile_blocks", default="auto", choices=["auto", "on", "outside", "off"],
                    help="torch.compile the transformer blocks. 'auto' (default) enables it only "
                         "when the run is long enough to repay its ~90 s warm-up and the VRAM fits "
                         "— roughly 600+ steps on INT8, 1200+ on NF4. Measured 2.0x per step on "
@@ -213,3 +213,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
