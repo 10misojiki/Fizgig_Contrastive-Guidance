@@ -428,7 +428,10 @@ def compile_boundary(quant_4bit: bool, quant_int8: str, vram_gb=None, caps=None,
         return "inside"          # NF4/other: outside unmeasured — behave as before
     caps = caps or detect()
     vram = vram_gb if vram_gb is not None else (caps.vram_free_gb or caps.vram_gb)
-    if vram is None:
+    if not vram:
+        # None OR the detect() default of 0.0 (no readable GPU): no basis to pick, and
+        # 0.0 falling through would read as "inside doesn't fit -> outside", which is a
+        # decision dressed as a default. Inside = today's behaviour.
         return "inside"
     _step_mp = float(mp) * max(1, int(batch))
     _res_gb = _COMPILE_GB_PER_MP * max(0.0, _step_mp - 0.25)
@@ -482,8 +485,15 @@ def should_compile(total_steps: int, quant_4bit: bool, quant_int8: str,
         # Inside-the-graph doesn't fit at this token load — try the OUTSIDE boundary
         # (#99): same fused kernels, eager-level stashes, measured ~27% faster than
         # eager at 1 MP. Only falls to uncompiled when even that can't fit.
+        # Batch is charged at the measured EAGER term, not laundered through the step-MP
+        # slope (which only starts at the anchor): the outside boundary's stashes ARE
+        # eager-checkpointing stashes, and this module's own history says batch is the
+        # single biggest term and the classic blind spot ("batch 2 sailed through the
+        # check and OOM'd"). Resolution above the anchor keeps the deliberately-too-steep
+        # inside slope, on mp alone.
         _out_need = (_INT8_COMPILE_OUTSIDE_PEAK_GB
-                     + _COMPILE_GB_PER_MP * max(0.0, _step_mp - _COMPILE_OUTSIDE_ANCHOR_MP))
+                     + _COMPILE_GB_PER_MP * max(0.0, float(mp) - _COMPILE_OUTSIDE_ANCHOR_MP)
+                     + _BATCH_GB_PER_IMAGE * max(0, int(batch) - 1))
         if vram >= _out_need + _HEADROOM_GB:
             _boundary = "outside"
         else:

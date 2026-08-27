@@ -1,4 +1,4 @@
-﻿"""Krea 2 LoRA training CLI (wraps fizgig.krea2.trainer.train_krea2).
+"""Krea 2 LoRA training CLI (wraps fizgig.krea2.trainer.train_krea2).
 
 The GUI drives the full run as three steps: krea2_cache_latents -> krea2_cache_text -> krea2_train.
 Trains on the RAW model; previews render on the fp8 Turbo (--turbo_dit) with the live LoRA.

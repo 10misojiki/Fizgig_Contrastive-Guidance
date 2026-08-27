@@ -231,7 +231,7 @@ def load_dit_for_training(
         # guard sees the base that actually loaded. compile_blocks may be the string
         # "outside" (high-res boundary, #99) — any other truthy value means "inside".
         _compile_blocks(dit, blocks_to_swap, fp8_scaled=fp8_scaled,
-                        boundary=("outside" if str(compile_blocks) == "outside"
+                        boundary=("outside" if str(compile_blocks).lower() == "outside"
                                   else "inside"))
     return dit, network, turbo_net, turbo_diffb
 
