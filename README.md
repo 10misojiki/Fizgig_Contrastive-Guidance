@@ -276,6 +276,7 @@ Fizgig ships as a ready-made cloud image — the **whole app in a browser tab**,
 - **AMD ROCm** — **Windows:** `install_fizgig_rocm.bat` (supported path). **Linux:** `./install_fizgig_rocm.sh` — **highly experimental** (newer gfx like RDNA4, desktop compositor + training on the same GPU, and driver resets are common; use Windows ROCm or NVIDIA Linux for production training). Optional system `amdrocm-amdsmi` for accurate status-bar VRAM via `amd-smi`.
 - **OS** — Windows 10 / 11 or Linux. macOS handles captioning and image prep, but training needs CUDA or ROCm.
 - **Python** — 3.10 – 3.13.
+- **System RAM** — 32 GB recommended; 16 GB is workable for **Klein 9B** and **Krea 2**. **MiniMax H3 is the outlier**: its text encoder is a 15.7 GB file that streams from system RAM while captions are cached, and INT8 block streaming stages a similar amount again during training — so 32 GB is comfortable, and 24 GB works only with other apps closed. Worth knowing: when system RAM runs short, the failure arrives dressed as **"CUDA error: out of memory"** even though the GPU is nearly empty. Close what else is running and retry the caching step before suspecting VRAM.
 - **Disk** — ~10 GB for the venv, plus ~40 GB for model files.
 - **Visual Studio Build Tools** (Windows only) — for InsightFace and the torch.compile speedup: **[aka.ms/vs/17/release/vs_BuildTools.exe](https://aka.ms/vs/17/release/vs_BuildTools.exe)**, tick **"Desktop development with C++"**. Without it everything still works minus the compile speedup.
 
