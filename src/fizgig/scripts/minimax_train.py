@@ -72,6 +72,17 @@ def setup_parser() -> argparse.ArgumentParser:
     p.add_argument("--caption_dropout", type=float, default=0.05,
                    help="Fraction of steps trained on the empty prompt (reference default 0.05; "
                         "needs the uncond embed cached by minimax_cache_text). 0 disables.")
+    p.add_argument("--guidance_distillation_scale", type=float, default=None, metavar="S",
+                   help="Preserve H3's guidance distillation on still-image prompt steps with "
+                        "one additional no-grad empty-prompt forward. 3.5 is the Fast+ starting "
+                        "point; unset disables the feature.")
+    p.add_argument("--guidance_loss_form", choices=["contrastive", "normalized"],
+                   default="contrastive",
+                   help="contrastive fits the extrapolated guided target directly (the Akane/"
+                        "AI Toolkit recipe); normalized de-guides the prediction before flow loss")
+    p.add_argument("--guidance_loss_schedule", choices=["sigma", "constant"], default="sigma",
+                   help="sigma fades the effective guidance scale toward 1 at the clean end; "
+                        "constant is an A/B mode")
     p.add_argument("--audio_weight", type=float, default=1.0,
                    help="Weight on the audio term for video clips that carry sound. Audio is "
                         "only ~4%% of the packed sequence, so parity may be too quiet to teach "
@@ -265,6 +276,9 @@ def main():
         optimizer_type=args.optimizer_type,
         optimizer_args=args.optimizer_args,
         caption_dropout=args.caption_dropout,
+        guidance_distillation_scale=args.guidance_distillation_scale,
+        guidance_loss_form=args.guidance_loss_form,
+        guidance_loss_schedule=args.guidance_loss_schedule,
         audio_weight=args.audio_weight,
         visual_stop_epoch=args.visual_stop_epoch,
         visual_stop_mode=args.visual_stop_mode,

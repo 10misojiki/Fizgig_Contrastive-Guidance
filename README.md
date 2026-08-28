@@ -114,11 +114,12 @@ Fizgig trains LoRAs for **MiniMax H3**, MiniMax's open-weight ~33B video model, 
 
 int8 is the checkpoint's own storage and the most accurate base (~0.17% error). Block swap **streams one way only** — ~6.4× faster than round-trip swap, which is what lets 16 and 24 GB cards keep the accurate base (design contributed by [@rintic-13](https://github.com/rintic-13), [#73](https://github.com/shootthesound/Fizgig/issues/73)). Hit an OOM anyway? Set Blocks Swap to a number to override the planner.
 
-Three built-in presets ship; **Fast** applies the moment you pick the family:
+Four built-in presets ship; **Fast** remains the baseline that applies when you pick the family:
 
 | Preset | Settings |
 |---|---|
 | **✨ MiniMax H3 Fast** | LoRA dim/alpha **8, 50 epochs, flat 2e-4**, **0.25 MP**, Training Structure **Likeness and Style**, `adamw`. Reaches likeness in a few hundred steps, and the lower rank tends to come out more flexible |
+| **🧪 MiniMax H3 Fast+ Guidance** | Image-only quality A/B: rank **8**, **1e-4**, Optimised Likeness **20-49**, **Contrastive Guidance 3.5 / Sigma**, and optional **Sigmoid** timestep sampling. Preserves H3's guidance-distilled field at the cost of one extra no-grad forward per captioned still |
 | **✨ MiniMax H3 (Lower LR - slower)** | The same at **rank 16, 60 epochs, flat 1e-4** — more suitable for larger datasets with longer trains |
 | **✨ MiniMax H3 Style** | The Fast recipe on the measured style blocks, `0-3, 6-47` — style lives almost everywhere in H3 except the few blocks that only do identity and voice |
 
@@ -129,6 +130,14 @@ train only the identity blocks (**20-49**) while video and audio clips train the
 Measured against full-model photo training: sharper, much better prompt following, better sound,
 fewer epochs — and the occasional deformed preview of full-model photo runs is gone. Untick it
 for style or scene training; while it's on, Blocks to Train is disabled with a note.
+
+**H3 guidance protection** is the second half of the Fast+ experiment. Optimised Likeness
+chooses *where* a still may update the model; Contrastive Guidance changes *what target* that
+update fits so ordinary image flow training does not progressively remove H3's baked-in
+guidance. It reuses the empty-prompt embedding already written by text caching, adds no package
+or model dependency, and runs only on captioned still-image steps. Video, voice and caption-
+dropout steps retain their existing loss. See the [Fast+ Windows/RTX 4090 guide](docs/H3_FASTPLUS_GUIDANCE.md)
+for the exact A/B and CLI recipe.
 
 **0.25 MP is the default, and it holds up** — four times cheaper per step than 1 MP, and the extra resolution has not paid for itself in testing. Raise it if a specific dataset asks for it.
 
@@ -221,6 +230,8 @@ Every control has a hint in the app; the highlights:
 - **Optimised Likeness Learning** (default On) — photo steps train the identity blocks (20-49) only; clips train the full model. The measured best recipe for character and voice work — untick for style or scene training.
 - **Blocks to Train** — hand-pick a subset of H3's 50 blocks (disabled while Optimised Likeness Learning owns the choice). The measured recipes: **`20-49` for likeness**, **`0-3, 6-47` for style** (the Style preset sets it), voice core `38-48`. Type ranges (`3-12, 22, 31-33`) to experiment beyond them.
 - **Reference distillation** (experimental) — teaches the LoRA to render your subject from the trigger word the way H3 renders them from a *photo*: each image is marked against the model shown *other* photos of the same person, so identity is learned without the scenery. Needs the ref2va model; the LoRA deploys on the ordinary model. **Aimed at Multi Concept**, where it demonstrably helps hold two people apart. **Identity-first** (Auto) trains a teacher-only first phase, then pure photos.
+- **H3 guidance protection** (Fast+ experiment) — a second no-grad empty-prompt forward preserves the CFG-distilled field during still-image learning. Start with Contrastive / 3.5 / Sigma; keep Reference distillation off for the first A/B.
+- **Timestep sampling** — Fizgig structure keeps the measured clean-end-share schedule; Sigmoid is available as an explicit A/B instead of silently replacing it for every H3 run.
 - **Multi Concept** — two subjects, two folders, two trigger words, one LoRA. Each subject's images are only ever compared against their own.
 - **Adapter-relative LR** (default Off) — the LR box becomes a ceiling the run climbs toward, keeping each step proportional to the adapter's size. Worth trying when a run overshoots early.
 - **Caption dropout** (default 0.05) and **Weight averaging (EMA)** (default Off) — leave dropout on; switch EMA on when pushing LR hard.

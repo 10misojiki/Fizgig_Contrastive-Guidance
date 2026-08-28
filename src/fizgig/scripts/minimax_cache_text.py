@@ -295,7 +295,7 @@ def main():
     post_process(datasets, all_files, all_paths, args.keep_cache)
 
     # One UNCONDITIONAL embed per cache dir (empty prompt -> the TE's single-pad fallback), so
-    # caption dropout has something to swap in for ~5% of steps.
+    # caption dropout can swap it in and H3 guidance protection can run its detached null pass.
     #
     # Written AFTER post_process, deliberately. Its filename ends `_minimaxh3_te.safetensors`, so
     # it matches the glob post_process uses to find stale caches — and since no dataset ITEM
@@ -312,7 +312,7 @@ def main():
                         "attention_mask": torch.ones(_uncond.shape[0], dtype=torch.bool)},
                        os.path.join(_dir, f"uncond_{ARCHITECTURE_MINIMAX}_te.safetensors"))
             _n += 1
-    logger.info(f"[uncond] cached the empty-prompt embed for caption dropout "
+    logger.info(f"[uncond] cached the empty-prompt embed for caption dropout / H3 guidance "
                 f"({tuple(_uncond.shape)}) in {_n} cache dir(s)")
 
 
