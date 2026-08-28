@@ -39,6 +39,13 @@ VIDEO_SIGMA_SHIFT_TRAIN = 12.0     # H3's video shift — also the reference TRA
 # two must move together if either ever moves.
 MINIMAX_LOWNOISE_SIGMA = 0.5
 
+# H3 ships with guidance already distilled into its conditional prediction. Ordinary flow
+# training asks that guided field to become the raw flow target and gradually removes the
+# distillation. Guidance-preserving training uses the model's own empty-prompt prediction to
+# turn the raw target into the guided field the released model represents.
+GUIDANCE_LOSS_FORMS = ("contrastive", "normalized")
+GUIDANCE_LOSS_SCHEDULES = ("sigma", "constant")
+
 # What a RETIRED category trains at in anchor mode — the Krea per-image ladder's tested floor.
 # One constant, not a knob: "anchor" is legible, "0.085 vs 0.12" is not.
 ANCHOR_LR_SCALE = 0.1
@@ -828,10 +835,66 @@ def sample_sigmas(batch: int, device, shift=None, generator=None,
     return (s * base) / (1.0 + (s - 1.0) * base)
 
 
+def guidance_scale_for_sigma(configured_scale: float, sigma: torch.Tensor,
+                             schedule: str = "sigma") -> torch.Tensor:
+    """Effective H3 guidance scale for each sample at its current noise level.
+
+    The sigma schedule is the AI Toolkit / Akane H3 recipe: extrapolation fades to a plain
+    flow target near the clean end, where ``target - uncond`` contains fresh noise the model
+    cannot infer. ``constant`` is kept as an explicit A/B mode.
+    """
+    scale = float(configured_scale)
+    if not math.isfinite(scale) or scale <= 1.0:
+        raise ValueError("H3 guidance distillation scale must be finite and greater than 1")
+    if schedule == "sigma":
+        return 1.0 + (scale - 1.0) * sigma
+    if schedule == "constant":
+        return torch.full_like(sigma, scale)
+    raise ValueError(f"unsupported H3 guidance loss schedule: {schedule!r}")
+
+
+def _guidance_scale_like(scale: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Broadcast one scale per batch item over an image/video prediction."""
+    if scale.ndim != 1 or scale.shape[0] != target.shape[0]:
+        raise ValueError(
+            f"H3 guidance scale shape {tuple(scale.shape)} cannot broadcast to "
+            f"prediction shape {tuple(target.shape)}")
+    return scale.reshape(scale.shape[0], *([1] * (target.ndim - 1)))
+
+
+def contrastive_guidance_target(flow_target: torch.Tensor,
+                                empty_prediction: torch.Tensor,
+                                effective_scale: torch.Tensor) -> torch.Tensor:
+    """Build ``u + g * (target - u)`` for direct contrastive guidance loss.
+
+    ``empty_prediction`` is detached by the caller. This is algebraically equivalent to
+    de-guiding the conditional prediction before ordinary flow loss, but intentionally keeps
+    the reference implementation's scale-squared loss magnitude.
+    """
+    if flow_target.shape != empty_prediction.shape:
+        raise ValueError("H3 flow target and empty prediction must have matching shapes")
+    g = _guidance_scale_like(effective_scale, flow_target)
+    return empty_prediction + g * (flow_target - empty_prediction)
+
+
+def guidance_normalized_prediction(guided_prediction: torch.Tensor,
+                                   empty_prediction: torch.Tensor,
+                                   effective_scale: torch.Tensor) -> torch.Tensor:
+    """Recover the raw conditional field from a guidance-distilled prediction."""
+    if guided_prediction.shape != empty_prediction.shape:
+        raise ValueError("H3 prompt and empty predictions must have matching shapes")
+    g = _guidance_scale_like(effective_scale, guided_prediction)
+    return (guided_prediction + (g - 1.0) * empty_prediction) / g
+
+
 def compute_loss(model, latent: torch.Tensor, text_embeds: torch.Tensor, *,
                  sigma: torch.Tensor = None, shift: float = None, generator=None,
                  noise: torch.Tensor = None, audio_latent: torch.Tensor = None,
                  audio_weight: float = 1.0, video_weight: float = 1.0,
+                 guidance_uncond_text: torch.Tensor = None,
+                 guidance_scale: float = None,
+                 guidance_loss_form: str = "contrastive",
+                 guidance_schedule: str = "sigma",
                  parts_out: dict = None):
     """One training step's loss.
 
@@ -850,6 +913,13 @@ def compute_loss(model, latent: torch.Tensor, text_embeds: torch.Tensor, *,
                   latent is a zeros placeholder. At 0 the video loss never enters the graph:
                   MSE against the dataset-mean latent is a real, wrong gradient ("every frame
                   looks like the average"), not a harmless no-op.
+    guidance_uncond_text: cached empty-prompt H3 embedding. When present on a still-image step,
+                  run one additional no-grad empty-prompt forward and preserve H3's released
+                  guidance-distilled field. Caption-dropout and non-image steps leave this None.
+    guidance_scale: authoritative distillation scale (>1; 3.5 is the Fast+ starting point).
+    guidance_loss_form: ``contrastive`` fits the extrapolated guided target directly;
+                  ``normalized`` de-guides the prediction before ordinary flow loss.
+    guidance_schedule: ``sigma`` fades guidance toward 1 at the clean end; ``constant`` is A/B.
 
     Returns (loss, sigma_used). parts_out, if given, receives the video and audio terms
     separately — they are on different noise schedules and averaging them into one number hides
@@ -883,13 +953,53 @@ def compute_loss(model, latent: torch.Tensor, text_embeds: torch.Tensor, *,
     t = (1.0 - sigma).to(device)
 
     if audio_latent is None:
-        pred = model(noised.to(latent.dtype), t, text_embeds)
-        loss = F.mse_loss(pred.float(), (x0 - noise).to(pred.dtype).float())
+        target = (x0 - noise).float()
+        if guidance_uncond_text is None:
+            pred = model(noised.to(latent.dtype), t, text_embeds)
+            loss = F.mse_loss(pred.float(), target.to(pred.dtype).float())
+        else:
+            if guidance_scale is None:
+                raise ValueError("guidance_uncond_text requires guidance_scale")
+            if guidance_loss_form not in GUIDANCE_LOSS_FORMS:
+                raise ValueError(f"unsupported H3 guidance loss form: {guidance_loss_form!r}")
+
+            # H3 always packs noised silence audio rows, even for a one-frame image. Both
+            # forwards must hear the SAME rows or their difference contains a random soundtrack
+            # instead of prompt guidance. This consumes the same one RNG draw as the ordinary
+            # forward; it is merely drawn here and supplied explicitly to both passes.
+            shared_audio_noise = None
+            if getattr(model, "pack_audio_rows", False):
+                from fizgig.minimax.model import (AUDIO_CHANNELS, audio_latents_for_frames,
+                                                   pixel_frames_for_latent)
+                n_audio = audio_latents_for_frames(pixel_frames_for_latent(x0.shape[2]))
+                shared_audio_noise = torch.randn(
+                    n_audio * AUDIO_CHANNELS, model.config.audio_latents_dim,
+                    device=device, dtype=torch.float32)
+
+            with torch.no_grad():
+                empty_pred = model(noised.to(latent.dtype), t, guidance_uncond_text,
+                                   shared_audio_noise).float().detach()
+            pred = model(noised.to(latent.dtype), t, text_embeds, shared_audio_noise)
+            effective = guidance_scale_for_sigma(guidance_scale, sigma, guidance_schedule)
+            if guidance_loss_form == "contrastive":
+                guided_target = contrastive_guidance_target(target, empty_pred, effective)
+                loss = F.mse_loss(pred.float(), guided_target.float())
+            else:
+                normalized = guidance_normalized_prediction(pred.float(), empty_pred, effective)
+                loss = F.mse_loss(normalized, target)
         if parts_out is not None:
-            parts_out.update(video=float(loss.detach()), audio=None)
+            parts_out.update(video=float(loss.detach()), audio=None,
+                             guidance_scale=(float(effective.reshape(-1)[0])
+                                             if guidance_uncond_text is not None else None))
         if video_weight != 1.0:              # degenerate (an audio item missing its rows) but honest
             loss = video_weight * loss
         return loss, float(sigma.reshape(-1)[0])
+
+    if guidance_uncond_text is not None:
+        # The fork's Fast+ feature deliberately protects one-frame image learning. Extending it
+        # to joint audio/video needs modality-specific sigmas and masks; silently applying the
+        # image formula there would be worse than leaving those established paths untouched.
+        raise ValueError("H3 guidance-preserving loss currently supports still-image steps only")
 
     # The audio stream denoises on its OWN schedule — shift 3 against video's 12 — and
     # remap_sigma is the closed form that keeps the two at the same underlying point. Noising the
@@ -2116,6 +2226,11 @@ def train_minimax(
     optimizer_type: str = "adamw8bit",
     optimizer_args: str = "",
     caption_dropout: float = 0.05,
+    # Preserve H3's released guidance-distilled field on still-image steps. The empty branch is
+    # no-grad and uses the live adapter, matching AI Toolkit and Akane's default null source.
+    guidance_distillation_scale: float = None,
+    guidance_loss_form: str = "contrastive",
+    guidance_loss_schedule: str = "sigma",
     # Clips with sound only. Audio is ~4% of the packed sequence at any clip length, so parity
     # may well be too quiet to teach anything — but it starts there, and moves on a measurement
     # rather than a guess. The per-epoch [audio] line reports the share it is actually winning.
@@ -2209,6 +2324,18 @@ def train_minimax(
     import math
 
     torch.manual_seed(seed)
+    _guidance_active = guidance_distillation_scale is not None
+    if _guidance_active:
+        if not math.isfinite(float(guidance_distillation_scale)) or float(guidance_distillation_scale) <= 1.0:
+            raise ValueError("guidance_distillation_scale must be finite and greater than 1")
+        if guidance_loss_form not in GUIDANCE_LOSS_FORMS:
+            raise ValueError(f"guidance_loss_form must be one of {GUIDANCE_LOSS_FORMS}")
+        if guidance_loss_schedule not in GUIDANCE_LOSS_SCHEDULES:
+            raise ValueError(f"guidance_loss_schedule must be one of {GUIDANCE_LOSS_SCHEDULES}")
+        if distill:
+            raise ValueError(
+                "Contrastive guidance and reference distillation are separate teacher objectives; "
+                "run them as separate A/B experiments instead of enabling both.")
     user_include_patterns = include_patterns   # None -> resolved per checkpoint below
     # Parse the block selection NOW, before the 21 GB base streams in: a typo surfacing after
     # the load costs minutes and reads like a crash rather than a correction. Bounds-checking
@@ -2819,10 +2946,10 @@ def train_minimax(
                     "the midpoint and probes from there).")
         lr_warmup_epochs = 0.0
 
-    # Caption dropout (reference default 0.05): swap in the cached empty-prompt embed for a
-    # random ~5% of steps. The uncond file is written by minimax_cache_text next to the caches.
+    # Caption dropout and guidance preservation share the cached empty-prompt embed. Guidance
+    # needs it even at dropout=0; minimax_cache_text writes it on every current caching pass.
     uncond_text = None
-    if caption_dropout and caption_dropout > 0:
+    if (caption_dropout and caption_dropout > 0) or _guidance_active:
         for _ds in group.datasets:
             _f = os.path.join(getattr(_ds, "cache_directory", "") or "",
                               f"uncond_{ARCHITECTURE_MINIMAX}_te.safetensors")
@@ -2831,10 +2958,21 @@ def train_minimax(
                 uncond_text = _lf(_f)["hidden_states"].unsqueeze(0)      # (1, L, 5120)
                 break
         if uncond_text is None:
+            if _guidance_active:
+                raise RuntimeError(
+                    "Guidance-preserving training needs the cached empty-prompt embedding. "
+                    "Run Cache Training Data again (text caching) and restart training.")
             logger.warning("[caption_dropout] no uncond embed in the cache dirs (re-run text "
                            "caching to enable it) — dropout disabled for this run")
-        else:
+        elif caption_dropout and caption_dropout > 0:
             logger.info(f"[caption_dropout] {caption_dropout:.2f} — empty-prompt embed loaded")
+
+    if _guidance_active:
+        logger.info(
+            "[guidance] IMAGE guidance protection ON — %s loss, scale %.3g, %s schedule. "
+            "Still-image prompt steps use one extra no-grad empty-prompt forward; caption-"
+            "dropout, video and voice steps keep their ordinary objective.",
+            guidance_loss_form, float(guidance_distillation_scale), guidance_loss_schedule)
 
     # Reference distillation needs nothing at run start: each item's reference conditioning AND
     # that reference's latent both ride in from the cache, one slot picked at random per step.
@@ -3028,6 +3166,12 @@ def train_minimax(
             "ss_train_adaln": "1" if _adaln_on else "0",
             "ss_distill": "dataset" if distill else "off",
             "ss_distill_weight": (f"{distill_weight:g}" if distill else "0"),
+            "ss_guidance_distillation": (guidance_loss_form if _guidance_active else "off"),
+            "ss_guidance_distillation_scale": (
+                f"{float(guidance_distillation_scale):g}" if _guidance_active else "0"),
+            "ss_guidance_loss_schedule": (
+                guidance_loss_schedule if _guidance_active else "off"),
+            "ss_guidance_scope": "images_only" if _guidance_active else "off",
             "ss_slow_blocks": _slow_used or "none",
             "ss_photo_blocks": (_photo_used if _photo_mask_params else "off"),
             "ss_block_limit": str(block_limit or 0),
@@ -3673,8 +3817,11 @@ def train_minimax(
             if latents.dim() == 4:
                 latents = latents.unsqueeze(2)                     # -> (1, 24, 1, H, W)
             text = batch["hidden_states"].to(device, dtype)        # (1, L, 5120)
-            if uncond_text is not None and random.random() < caption_dropout:
+            _caption_dropped = False
+            if (caption_dropout and caption_dropout > 0 and uncond_text is not None
+                    and random.random() < caption_dropout):
                 text = uncond_text.to(device, dtype)               # caption dropout step
+                _caption_dropped = True
             _is_voice = bool(batch.get("audio_only") is not None and batch["audio_only"].any())
             if not _is_photo or _is_voice:
                 _window_photo_only[0] = False
@@ -3720,9 +3867,20 @@ def train_minimax(
                 _a = batch.get("audio_latent")
                 if _a is not None:
                     _a = _a[0].to(device)            # (1, A*2, 32) -> the DiT's row block
+                # A dropped caption is already the empty branch, so there is no conditional
+                # field to contrast. Clips/voice keep their established joint-modality loss;
+                # Fast+ deliberately protects only Fizgig's one-frame image path.
+                _guidance_text = (uncond_text.to(device, dtype)
+                                  if (_guidance_active and _is_photo
+                                      and not _caption_dropped and not _is_voice)
+                                  else None)
                 loss, _step_sigma = compute_loss(dit, latents, text, shift=shift,
                                                  audio_latent=_a, audio_weight=audio_weight,
                                                  video_weight=0.0 if _is_voice else 1.0,
+                                                 guidance_uncond_text=_guidance_text,
+                                                 guidance_scale=guidance_distillation_scale,
+                                                 guidance_loss_form=guidance_loss_form,
+                                                 guidance_schedule=guidance_loss_schedule,
                                                  parts_out=_audio_parts)
                 if _is_voice:
                     # Its own ledger. The clip ledger's "video err" is a real number about real

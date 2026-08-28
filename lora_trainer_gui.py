@@ -856,6 +856,13 @@ MINIMAX_BUILT_IN_PRESETS = {
         # Carried so "load Defaults" genuinely resets it. Multi Concept overrides this to Off
         # when it is on, and the command builder locks it there regardless.
         "MINIMAX_CAPTION_DROPOUT": "0.05 (default)",
+        # Guidance protection is opt-in on the established baseline. The Fast+ preset below
+        # turns it on, so the original Fast recipe remains a clean A/B control.
+        "MINIMAX_GUIDANCE": False,
+        "MINIMAX_GUIDANCE_SCALE": "3.5",
+        "MINIMAX_GUIDANCE_FORM": "Contrastive",
+        "MINIMAX_GUIDANCE_SCHEDULE": "Sigma",
+        "MINIMAX_TIMESTEP_MODE": "Fizgig structure",
         "MAX_TRAIN_EPOCHS": 60, "SAVE_EVERY_N_EPOCHS": 1, "SEED": 42,
         "ADAPTIVE_LR": False, "ADAPTIVE_LR_MIN": "1e-5", "ADAPTIVE_LR_MAX": "4e-4",
         # adamw, NOT adamw8bit — the single biggest likeness change measured on H3 (2026-08-06).
@@ -926,6 +933,25 @@ MINIMAX_BUILT_IN_PRESETS["✨ MiniMax H3 Fast (LoRA 8, 50 epochs)"] = {
     # this preset reproduces had no ramp at all.
     "MINIMAX_ADAPTER_RAMP": "Off",
     "ADAPTIVE_LR": False,
+}
+
+# --- MiniMax H3 Fast+ Guidance ---------------------------------------------------------------
+# The quality-focused image-only fork recipe. Contrastive Guidance solves a different problem
+# from Optimised Likeness Learning: the latter chooses WHERE photos may update H3 (20-49), while
+# this preserves WHAT kind of guided field the CFG-distilled base represents. The measured
+# Fizgig structure stays the default so the preset changes one quality mechanism at a time;
+# Sigmoid remains a one-click third arm of the A/B/C.
+MINIMAX_BUILT_IN_PRESETS["🧪 MiniMax H3 Fast+ Guidance (LoRA 8)"] = {
+    **MINIMAX_BUILT_IN_PRESETS["✨ MiniMax H3 Fast (LoRA 8, 50 epochs)"],
+    "LEARNING_RATE": 1e-4,
+    "MINIMAX_GUIDANCE": True,
+    "MINIMAX_GUIDANCE_SCALE": "3.5",
+    "MINIMAX_GUIDANCE_FORM": "Contrastive",
+    "MINIMAX_GUIDANCE_SCHEDULE": "Sigma",
+    "MINIMAX_TIMESTEP_MODE": "Fizgig structure",
+    # Keep reference distillation out of the first experiment. It is a separate teacher
+    # objective and the trainer rejects stacking both until that interaction is measured.
+    "MINIMAX_DISTILL": False,
 }
 
 # --- MiniMax H3 Style -------------------------------------------------------------------------
@@ -1716,6 +1742,13 @@ class LoRATrainerGUI:
             # work H3 is for. The Style preset turns it OFF (style needs the early blocks).
             "MINIMAX_LIKENESS_OPT": True,
             "MINIMAX_DISTILL": False,      # off = ordinary training
+            # Guidance-preserving image learning. Existing configs stay off; the Fast+ preset
+            # is the deliberate opt-in and supplies the full reference starting-point tuple.
+            "MINIMAX_GUIDANCE": False,
+            "MINIMAX_GUIDANCE_SCALE": "3.5",
+            "MINIMAX_GUIDANCE_FORM": "Contrastive",
+            "MINIMAX_GUIDANCE_SCHEDULE": "Sigma",
+            "MINIMAX_TIMESTEP_MODE": "Fizgig structure",
             # Which H3 base ordinary training runs on ("fl2va"/"ref2va"). NOT in any preset —
             # the Training Base dropdown's var lives outside self.entries by design.
             "MINIMAX_TRAIN_BASE": "fl2va",
@@ -3742,6 +3775,67 @@ class LoRATrainerGUI:
         if folder:
             self._concept_folder_vars[0].set(folder)
 
+    def _sync_minimax_guidance_state(self):
+        """Keep the Fast+ controls truthful and separate from reference distillation."""
+        on = bool(getattr(self, "minimax_guidance_var", None)
+                  and self.minimax_guidance_var.get())
+        state = "readonly" if on else "disabled"
+        for key in ("MINIMAX_GUIDANCE_SCALE", "MINIMAX_GUIDANCE_FORM",
+                    "MINIMAX_GUIDANCE_SCHEDULE"):
+            w = self.entries.get(key)
+            if w is not None:
+                try:
+                    w.config(state=state)
+                except tk.TclError:
+                    pass
+
+        # Both are extra teacher objectives. Stacking them before an A/B exists would make a
+        # result impossible to interpret, so choosing guidance turns dataset-reference
+        # distillation off and greys it until guidance is released again.
+        distill = getattr(self, "minimax_distill_var", None)
+        if on and distill is not None and distill.get():
+            distill.set(False)
+        cb = getattr(self, "_minimax_distill_cb", None)
+        if cb is not None:
+            try:
+                cb.config(state="disabled" if on else "normal")
+            except tk.TclError:
+                pass
+        try:
+            self._sync_distill_weight_state()
+        except Exception:
+            pass
+
+    def _on_minimax_guidance_clicked(self):
+        self._sync_minimax_guidance_state()
+        if self.minimax_guidance_var.get():
+            self.update_console(
+                "[guidance] H3 image guidance protection enabled — reference distillation "
+                "is kept off so this remains a clean A/B.\n")
+
+    def _sync_minimax_timestep_mode(self):
+        """Sigmoid owns the density; disable the percentage-based structure while it does."""
+        w = self.entries.get("MINIMAX_TIMESTEP_MODE")
+        sigmoid = bool(w is not None and str(w.get()).lower().startswith("sigmoid"))
+        combo = getattr(self, "_minimax_structure_combo", None)
+        if combo is not None:
+            try:
+                combo.config(state="disabled" if sigmoid else "readonly")
+            except tk.TclError:
+                pass
+        # The custom percentage is independently shown/hidden by the structure handler. Let it
+        # run first, then grey it when Sigmoid makes the value inapplicable.
+        try:
+            self._refresh_minimax_structure_ui()
+        except Exception:
+            pass
+        pct = self.entries.get("MINIMAX_LOWNOISE_PCT")
+        if pct is not None:
+            try:
+                pct.config(state="disabled" if sigmoid else "normal")
+            except tk.TclError:
+                pass
+
     def _sync_distill_weight_state(self):
         """Grey the teacher-weight box while identity-first is running the show.
 
@@ -3806,6 +3900,14 @@ class LoRATrainerGUI:
     def _on_minimax_distill_clicked(self):
         """Only on a real click: setting the var programmatically must stay silent."""
         if self.minimax_distill_var.get():
+            if (getattr(self, "minimax_guidance_var", None)
+                    and self.minimax_guidance_var.get()):
+                self.minimax_distill_var.set(False)
+                messagebox.showinfo(
+                    "Choose one H3 teacher objective",
+                    "Guidance protection and reference distillation need separate A/B runs. "
+                    "Turn off H3 guidance protection first if you want reference distillation.")
+                return
             self._warn_if_no_ref_dit()
 
     def _on_minimax_multiconcept_clicked(self):
@@ -3816,6 +3918,11 @@ class LoRATrainerGUI:
         overwrite settings the user had changed, every time they visited the tab."""
         if self.minimax_multiconcept_var.get():
             _changed = []
+            if (getattr(self, "minimax_guidance_var", None)
+                    and self.minimax_guidance_var.get()):
+                self.minimax_guidance_var.set(False)
+                self._sync_minimax_guidance_state()
+                _changed.append("guidance=off (separate A/B)")
             for _k, _v in self._MULTICONCEPT_DEFAULTS.items():
                 _w = self.entries.get(_k)
                 if _w is not None and str(_w.get()) != _v:
@@ -4983,11 +5090,84 @@ class LoRATrainerGUI:
         self._minimax_capdrop_hint.grid(row=30, column=0, columnspan=2, sticky=tk.W, padx=5,
                                         pady=(0, 4))
 
+        # --- Guidance-distillation protection (MiniMax image steps only) ------------------
+        self._minimax_guidance_label = ttk.Label(scheduler_content,
+                                                  text="H3 guidance protection:")
+        self._minimax_guidance_label.grid(row=31, column=0, sticky=tk.W, padx=5,
+                                          pady=(8, 0))
+        self._minimax_guidance_frame = ttk.Frame(scheduler_content)
+        self._minimax_guidance_frame.grid(row=31, column=1, columnspan=2, sticky=tk.W,
+                                          padx=5, pady=(8, 0))
+        self.minimax_guidance_var = tk.BooleanVar(
+            value=bool(self.settings.get("MINIMAX_GUIDANCE", False)))
+        self._minimax_guidance_cb = ttk.Checkbutton(
+            self._minimax_guidance_frame, text="Preserve distilled guidance",
+            variable=self.minimax_guidance_var,
+            command=self._on_minimax_guidance_clicked)
+        self._minimax_guidance_cb.pack(side=tk.LEFT)
+        ttk.Label(self._minimax_guidance_frame, text="   scale ").pack(side=tk.LEFT)
+        self.entries["MINIMAX_GUIDANCE_SCALE"] = ttk.Combobox(
+            self._minimax_guidance_frame, values=["2.5", "3.0", "3.5", "4.0"],
+            width=5, state="readonly")
+        self.entries["MINIMAX_GUIDANCE_SCALE"].set(
+            str(self.settings.get("MINIMAX_GUIDANCE_SCALE", "3.5")))
+        self.entries["MINIMAX_GUIDANCE_SCALE"].pack(side=tk.LEFT)
+        ttk.Label(self._minimax_guidance_frame, text="   form ").pack(side=tk.LEFT)
+        self.entries["MINIMAX_GUIDANCE_FORM"] = ttk.Combobox(
+            self._minimax_guidance_frame, values=["Contrastive", "Normalized"],
+            width=12, state="readonly")
+        self.entries["MINIMAX_GUIDANCE_FORM"].set(
+            str(self.settings.get("MINIMAX_GUIDANCE_FORM", "Contrastive")))
+        self.entries["MINIMAX_GUIDANCE_FORM"].pack(side=tk.LEFT)
+        ttk.Label(self._minimax_guidance_frame, text="   schedule ").pack(side=tk.LEFT)
+        self.entries["MINIMAX_GUIDANCE_SCHEDULE"] = ttk.Combobox(
+            self._minimax_guidance_frame, values=["Sigma", "Constant"],
+            width=9, state="readonly")
+        self.entries["MINIMAX_GUIDANCE_SCHEDULE"].set(
+            str(self.settings.get("MINIMAX_GUIDANCE_SCHEDULE", "Sigma")))
+        self.entries["MINIMAX_GUIDANCE_SCHEDULE"].pack(side=tk.LEFT)
+        self._minimax_guidance_hint = ttk.Label(
+            scheduler_content,
+            text="Quality protection for H3's CFG-distilled base. Each captioned still gets one "
+                 "extra no-grad empty-prompt forward; video, voice and caption-dropout steps stay "
+                 "on their existing loss. Contrastive 3.5 + Sigma is the Fast+ starting point. "
+                 "Expect image steps to take roughly 1.5–2× as long.",
+            foreground=COLORS["text_explain"], font=(FONT_FAMILY, 9, "italic"),
+            justify=tk.LEFT, wraplength=720)
+        self._minimax_guidance_hint.grid(row=32, column=0, columnspan=3, sticky=tk.W,
+                                         padx=5, pady=(0, 4))
+
+        # --- Timestep base distribution (MiniMax only) -----------------------------------
+        self._minimax_timestep_mode_label = ttk.Label(scheduler_content,
+                                                       text="Timestep sampling:")
+        self._minimax_timestep_mode_label.grid(row=33, column=0, sticky=tk.W, padx=5,
+                                                pady=(8, 0))
+        self._minimax_timestep_mode_frame = ttk.Frame(scheduler_content)
+        self._minimax_timestep_mode_frame.grid(row=33, column=1, columnspan=2, sticky=tk.W,
+                                                padx=5, pady=(8, 0))
+        self.entries["MINIMAX_TIMESTEP_MODE"] = ttk.Combobox(
+            self._minimax_timestep_mode_frame,
+            values=["Fizgig structure", "Sigmoid (A/B)"], width=24, state="readonly")
+        self.entries["MINIMAX_TIMESTEP_MODE"].set(
+            str(self.settings.get("MINIMAX_TIMESTEP_MODE", "Fizgig structure")))
+        self.entries["MINIMAX_TIMESTEP_MODE"].pack(side=tk.LEFT)
+        self.entries["MINIMAX_TIMESTEP_MODE"].bind(
+            "<<ComboboxSelected>>", lambda _e: self._sync_minimax_timestep_mode())
+        self._minimax_timestep_mode_hint = ttk.Label(
+            scheduler_content,
+            text="Fizgig structure keeps the measured Clean-end share control. Sigmoid is the "
+                 "Akane/Reddit A/B distribution and ignores that percentage; it is not forced "
+                 "globally because earlier Fizgig runs found it can overdrive small datasets.",
+            foreground=COLORS["text_explain"], font=(FONT_FAMILY, 9, "italic"),
+            justify=tk.LEFT, wraplength=720)
+        self._minimax_timestep_mode_hint.grid(row=34, column=0, columnspan=3, sticky=tk.W,
+                                              padx=5, pady=(0, 4))
+
         # --- Blocks to Train (MiniMax only, experimental) ---------------------------------
         self._minimax_blocks_label = ttk.Label(scheduler_content, text="Blocks to Train:")
-        self._minimax_blocks_label.grid(row=31, column=0, sticky=tk.W, padx=5, pady=(8, 2))
+        self._minimax_blocks_label.grid(row=35, column=0, sticky=tk.W, padx=5, pady=(8, 2))
         self._minimax_blocks_frame = ttk.Frame(scheduler_content)
-        self._minimax_blocks_frame.grid(row=31, column=1, columnspan=2, sticky=tk.W, padx=5, pady=(8, 2))
+        self._minimax_blocks_frame.grid(row=35, column=1, columnspan=2, sticky=tk.W, padx=5, pady=(8, 2))
         # Editable, not readonly — the presets are starting points and the real control is typing
         # a spec. Anything the trainer's parser takes is legal here.
         self.entries["MINIMAX_BLOCKS"] = ttk.Combobox(
@@ -5008,8 +5188,10 @@ class LoRATrainerGUI:
             scheduler_content,
             text=self._MINIMAX_BLOCKS_HINT,
             foreground=COLORS["text_explain"], font=(FONT_FAMILY, 9, "italic"), justify=tk.LEFT, wraplength=720)
-        self._minimax_blocks_hint.grid(row=32, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
+        self._minimax_blocks_hint.grid(row=36, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
         self._refresh_minimax_blocks_count()
+        self._sync_minimax_guidance_state()
+        self._sync_minimax_timestep_mode()
 
         # Training Structure lives in Training Parameters now — see _build_minimax_structure_row,
         # called from that section. It used to sit here in Other Options, collapsed, which is
@@ -5455,6 +5637,8 @@ class LoRATrainerGUI:
 
         if "MINIMAX_DISTILL" in preset and hasattr(self, "minimax_distill_var"):
             self.minimax_distill_var.set(bool(preset["MINIMAX_DISTILL"]))
+        if "MINIMAX_GUIDANCE" in preset and hasattr(self, "minimax_guidance_var"):
+            self.minimax_guidance_var.set(bool(preset["MINIMAX_GUIDANCE"]))
 
         # Multi Concept: a BooleanVar plus a LIST of folders, so neither is reachable by the
         # generic self.entries loop above. Restore the folders BEFORE the toggle so the handler
@@ -5477,6 +5661,11 @@ class LoRATrainerGUI:
                 pass
         try:
             self._sync_distill_weight_state()
+        except Exception:
+            pass
+        try:
+            self._sync_minimax_guidance_state()
+            self._sync_minimax_timestep_mode()
         except Exception:
             pass
 
@@ -5996,8 +6185,11 @@ class LoRATrainerGUI:
         # Detail Focus only means anything for MiniMax, and it's the whole point of queueing a
         # shift sweep — without it two rows of an A/B look identical in the manager.
         if ARCHITECTURES.get(item.get("architecture", ""), {}).get("is_minimax"):
+            _tm = str(p.get("MINIMAX_TIMESTEP_MODE") or "Fizgig structure")
             _sh = str(p.get("MINIMAX_LOWNOISE_PCT") or "").strip()
-            if _sh:
+            if _tm.lower().startswith("sigmoid"):
+                bits.append("sigmoid")
+            elif _sh:
                 bits.append(f"low-noise {_sh}%")
             _hl = str(p.get("MINIMAX_HIGHNOISE_LR_PCT") or "100").strip()
             if _hl and _hl != "100":
@@ -6013,6 +6205,11 @@ class LoRATrainerGUI:
             if p.get("MINIMAX_DISTILL"):
                 bits.append(f"distill x{p.get('MINIMAX_DISTILL_WEIGHT', '0.8')}"
                             f" ({p.get('MINIMAX_DISTILL_REFS', '2')} refs)")
+            if p.get("MINIMAX_GUIDANCE"):
+                _gf = str(p.get("MINIMAX_GUIDANCE_FORM", "Contrastive")).lower()
+                _glabel = "CG" if _gf.startswith("contrast") else "normalized guidance"
+                bits.append(f"{_glabel} x{p.get('MINIMAX_GUIDANCE_SCALE', '3.5')} "
+                            f"{str(p.get('MINIMAX_GUIDANCE_SCHEDULE', 'Sigma')).lower()}")
             _sl = str(p.get("MINIMAX_SLOW_BLOCKS") or "").strip()
             if _sl and str(p.get("MINIMAX_SLOW_LR_SCALE", "1")).strip() not in ("", "1", "1.0"):
                 bits.append(f"slow {_sl} ×{p.get('MINIMAX_SLOW_LR_SCALE')}")
@@ -6300,6 +6497,7 @@ class LoRATrainerGUI:
         # above does NOT see it — without this a queued distillation run loses its reference
         # and silently becomes an ordinary run (tests/test_minimax_distill_gui.py).
         _grab("minimax_distill_var", "MINIMAX_DISTILL")
+        _grab("minimax_guidance_var", "MINIMAX_GUIDANCE")
         _grab("minimax_multiconcept_var", "MINIMAX_MULTICONCEPT")
         _grab("grad_checkpoint_var", "GRADIENT_CHECKPOINTING")
         _grab("fp8_text_encoder_var", "FP8_TEXT_ENCODER")
@@ -7056,6 +7254,10 @@ class LoRATrainerGUI:
                   self._minimax_ramp_label, self._minimax_ramp_frame, self._minimax_ramp_hint,
                   self._minimax_capdrop_label, self._minimax_capdrop_frame,
                   self._minimax_capdrop_hint,
+                  self._minimax_guidance_label, self._minimax_guidance_frame,
+                  self._minimax_guidance_hint,
+                  self._minimax_timestep_mode_label, self._minimax_timestep_mode_frame,
+                  self._minimax_timestep_mode_hint,
                   self._minimax_mc_frame,
                   ):
             self._set_widget_visible(w, is_minimax)
@@ -7070,6 +7272,8 @@ class LoRATrainerGUI:
         if is_minimax:
             self._on_minimax_multiconcept_toggle()
             self._sync_distill_weight_state()
+            self._sync_minimax_guidance_state()
+            self._sync_minimax_timestep_mode()
         else:
             for w in (self._minimax_mc_dir_frame, self._minimax_mc_hint,
                       self._minimax_mc_nodistill_hint):
@@ -24810,6 +25014,15 @@ class LoRATrainerGUI:
             "MINIMAX_LIKENESS_OPT": bool(self.entries["MINIMAX_LIKENESS_OPT"].get()),
             "MINIMAX_TRAIN_ADALN": bool(self.entries["MINIMAX_TRAIN_ADALN"].get()),
             "MINIMAX_DISTILL": bool(self.minimax_distill_var.get()),
+            "MINIMAX_GUIDANCE": bool(self.minimax_guidance_var.get()),
+            "MINIMAX_GUIDANCE_SCALE": str(
+                self.entries["MINIMAX_GUIDANCE_SCALE"].get() or "3.5").strip(),
+            "MINIMAX_GUIDANCE_FORM": str(
+                self.entries["MINIMAX_GUIDANCE_FORM"].get() or "Contrastive").strip(),
+            "MINIMAX_GUIDANCE_SCHEDULE": str(
+                self.entries["MINIMAX_GUIDANCE_SCHEDULE"].get() or "Sigma").strip(),
+            "MINIMAX_TIMESTEP_MODE": str(
+                self.entries["MINIMAX_TIMESTEP_MODE"].get() or "Fizgig structure").strip(),
             # Canonical key ("fl2va"/"ref2va"), never the display label. Preset-immune by
             # design — the var is outside self.entries and _collect_preset_values skips it.
             "MINIMAX_TRAIN_BASE": minimax_train_base(
@@ -25918,12 +26131,16 @@ class LoRATrainerGUI:
         # The trainer stamps the same thing into the LoRA as ss_timestep_density.
         # Low-noise share -> shift. Always sent, including the default, so the launched command
         # records which density ran instead of leaving it implicit.
-        # Always the plain uniform-base shift. A saved preset or queue row carrying the retired
-        # MINIMAX_LOGNORM is deliberately ignored rather than migrated — mid-concentrated is the
-        # thing being removed, so honouring it here would keep shipping the fault.
-        _shift = minimax_lownoise_to_shift(self.settings.get("MINIMAX_LOWNOISE_PCT"))
-        if _shift is not None:
-            cmd += ["--shift", f"{_shift:g}"]
+        # Fizgig structure uses its plain uniform-base shift. Sigmoid is an explicit Fast+ A/B;
+        # a saved preset or queue row carrying the retired MINIMAX_LOGNORM is still deliberately
+        # ignored rather than migrated.
+        _tm = str(self.settings.get("MINIMAX_TIMESTEP_MODE", "Fizgig structure") or "")
+        if _tm.lower().startswith("sigmoid"):
+            cmd += ["--shift", "sigmoid"]
+        else:
+            _shift = minimax_lownoise_to_shift(self.settings.get("MINIMAX_LOWNOISE_PCT"))
+            if _shift is not None:
+                cmd += ["--shift", f"{_shift:g}"]
         _hl = minimax_highnoise_lr(self.settings.get("MINIMAX_HIGHNOISE_LR_PCT"))
         if _hl is not None and abs(_hl - 1.0) > 1e-9:
             cmd += ["--highnoise_lr_scale", f"{_hl:g}"]
@@ -25949,6 +26166,22 @@ class LoRATrainerGUI:
         # the two flags never fight.
         if self.settings.get("MINIMAX_LIKENESS_OPT"):
             cmd += ["--photo_blocks", MINIMAX_LIKENESS_BLOCKS]
+        # Guidance-distillation protection — images only. The cache pass already writes the
+        # empty-prompt embedding; the trainer stops with an actionable re-cache message if this
+        # is an older cache. Reference distillation is mutually exclusive in both UI and core.
+        if self.settings.get("MINIMAX_GUIDANCE"):
+            _gs = str(self.settings.get("MINIMAX_GUIDANCE_SCALE", "3.5") or "3.5").strip()
+            try:
+                _gs = f"{float(_gs):g}"
+            except ValueError:
+                _gs = "3.5"
+            _gf = str(self.settings.get("MINIMAX_GUIDANCE_FORM", "Contrastive")).lower()
+            _gsch = str(self.settings.get("MINIMAX_GUIDANCE_SCHEDULE", "Sigma")).lower()
+            cmd += ["--guidance_distillation_scale", _gs,
+                    "--guidance_loss_form", ("normalized" if _gf.startswith("norm")
+                                              else "contrastive"),
+                    "--guidance_loss_schedule", ("constant" if _gsch.startswith("const")
+                                                  else "sigma")]
         # Reference distillation. Both flags travel together; the trainer also needs --vae to
         # encode the reference, which the sample block may already have added.
         if self.settings.get("MINIMAX_DISTILL"):
